@@ -1,0 +1,3 @@
+# Requirements for Biodiversity-Database
+requests
+supabase
