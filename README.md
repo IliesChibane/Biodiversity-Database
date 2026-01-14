@@ -125,7 +125,7 @@ python3 species_zip/extract.py <path/to/input.zip> <path/to/output.txt>
 
 `<path/to/input.zip>` : le path du fichier ZIP
 
-`<path/to/output.txt>` : le path du fichier txt généré (Appelez le a chaque species_keys_<specie>.txt)
+`<path/to/output.txt>` : le path du fichier txt généré (Appelez le a chaque `species_keys_<specie>.txt`)
 
 Lancer cette commande pour chaque zip a la suite pour économiser du temps ils seront tous exécuter en parralèle.
 
