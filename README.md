@@ -15,6 +15,16 @@ Un compte peut etre créer sur le site de GBIF : https://www.gbif.org/
 npm install supabase --save-dev
 ```
 
+- Installer psql :
+  - Linux/WSL :
+    ```bash
+    sudo apt install postgresql-client-common
+    sudo apt install postgresql-client -y
+    psql --version
+    ```
+  - Windows :
+    Suivre ce lien : https://www.postgresql.org/download/windows/
+
 - Installer Python3
   
 - Récupérer le projet via Github : [GitHub - IliesChibane/Biodiversity-Database](https://github.com/IliesChibane/Biodiversity-Database#)
@@ -36,6 +46,14 @@ pip install -r requirements.txt
 
 ```bash
 npx supabase start
+psql postgresql://postgres:postgres@localhost:54322/postgres < supabase/full_dump.sql
+```
+
+Si la commande ne fonctionne pas sur windows essayer cette commande :
+```bash
+npx supabase start
+psql "postgresql://postgres:postgres@localhost:54322/postgres" `
+  -f supabase/full_dump.sql
 ```
 
 Une fois fait vous aurez accès a une secrète key copier la et ajouter au script python `publish_supabase.py` a l'endroit assigner.
