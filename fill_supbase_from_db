@@ -1,0 +1,303 @@
+from supabase import create_client, Client
+import pandas as pd
+from images import get_images
+from wikidata_id import get_external_ids_from_gbif_taxon
+import requests
+from dotenv import load_dotenv
+import os
+import logging
+import sys
+import json
+import time
+import math
+
+def sanitize_for_json(d):
+    if isinstance(d, dict):
+        return {k: sanitize_for_json(v) for k, v in d.items()}
+    elif isinstance(d, list):
+        return [sanitize_for_json(v) for v in d]
+    elif isinstance(d, float):
+        if math.isnan(d) or math.isinf(d):
+            return None
+        return d
+    else:
+        return d
+
+load_dotenv()
+
+# Set up logging
+logging.basicConfig(
+    filename='fill_supabase_from_db.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Also log to console
+console = logging.StreamHandler(sys.stdout)
+console.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+console.setFormatter(formatter)
+logger.addHandler(console)
+
+SUPABASE_URL = os.getenv("SUPABASE_PUBLIC_URL")
+SUPABASE_KEY = os.getenv("SERVICE_ROLE_KEY")
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+CHECKPOINT_FILE = 'checkpoint_db.txt'
+GBIF_CACHE_FILE = 'gbif_cache.json'
+WIKIDATA_CACHE_FILE = 'wikidata_cache.json'
+
+
+def load_json_file(path):
+    if os.path.exists(path):
+        try:
+            with open(path, 'r') as f:
+                return json.load(f)
+        except Exception:
+            logger.warning(f"Could not read {path}, starting fresh")
+    return {}
+
+
+def save_json_file(path, data):
+    try:
+        with open(path, 'w') as f:
+            json.dump(data, f)
+    except Exception as e:
+        logger.error(f"Failed to save {path}: {e}")
+
+
+def save_checkpoint(index):
+    try:
+        with open(CHECKPOINT_FILE, 'w') as f:
+            f.write(str(index))
+        logger.info(f"Checkpoint saved at index {index}")
+    except Exception as e:
+        logger.error(f"Failed to save checkpoint: {e}")
+
+
+def load_checkpoint():
+    if os.path.exists(CHECKPOINT_FILE):
+        try:
+            with open(CHECKPOINT_FILE, 'r') as f:
+                return int(f.read().strip())
+        except Exception:
+            logger.warning("Could not read checkpoint, starting from 0")
+    return 0
+
+
+def get_gbif_taxon_id_cached(scientific_name: str, gbif_cache: dict):
+    if scientific_name in gbif_cache:
+        logger.info(f"GBIF cache hit for '{scientific_name}': {gbif_cache[scientific_name]}")
+        return gbif_cache[scientific_name]
+
+    try:
+        url = "https://api.gbif.org/v1/species/match"
+        params = {"name": scientific_name}
+
+        logger.info(f"Fetching GBIF ID for '{scientific_name}'")
+        response = requests.get(url, params=params, timeout=30)
+        response.raise_for_status()
+
+        data = response.json()
+        gbif_id = data.get("usageKey")
+        gbif_cache[scientific_name] = gbif_id
+        save_json_file(GBIF_CACHE_FILE, gbif_cache)
+        logger.info(f"GBIF ID for '{scientific_name}': {gbif_id}")
+        return gbif_id
+    except Exception as e:
+        logger.error(f"Error fetching GBIF ID for '{scientific_name}': {e}")
+        gbif_cache[scientific_name] = None
+        try:
+            save_json_file(GBIF_CACHE_FILE, gbif_cache)
+        except Exception:
+            pass
+        return None
+
+
+def get_external_ids_from_gbif_taxon_cached(gbif_taxon, wikidata_cache: dict):
+    key = str(gbif_taxon)
+    if key in wikidata_cache:
+        logger.info(f"Wikidata cache hit for GBIF {key}")
+        return wikidata_cache[key]
+    try:
+        ids = get_external_ids_from_gbif_taxon(gbif_taxon) if gbif_taxon is not None else {}
+        wikidata_cache[key] = ids
+        save_json_file(WIKIDATA_CACHE_FILE, wikidata_cache)
+        logger.info(f"Cached Wikidata IDs for GBIF {key}")
+        return ids
+    except Exception as e:
+        logger.error(f"Error fetching Wikidata IDs for GBIF {key}: {e}")
+        wikidata_cache[key] = {}
+        try:
+            save_json_file(WIKIDATA_CACHE_FILE, wikidata_cache)
+        except Exception:
+            pass
+        return {}
+
+
+def update_payload_and_write(taxon_name, payload, taxvern_row, df_bdc, gbif_cache, wikidata_cache):
+    # Update fields from TAXVERN row if available
+    try:
+        if taxvern_row is not None:
+            payload["Groupe_1"] = taxvern_row.get("GROUP1_INPN")
+            payload["Groupe_2"] = taxvern_row.get("GROUP2_INPN")
+            payload["Groupe_3"] = taxvern_row.get("GROUP3_INPN")
+            payload["Habitat"] = taxvern_row.get("HABITAT")
+            payload["Rank_Id"] = taxvern_row.get("RANG")
+            payload["Tribu"] = taxvern_row.get("TRIBU")
+            payload["Sous-famille"] = taxvern_row.get("SOUS_FAMILLE")
+            payload["CD_TAXSUP"] = taxvern_row.get("CD_TAXSUP")
+            payload["CD_SUP"] = taxvern_row.get("CD_SUP")
+            payload["CD_BA"] = taxvern_row.get("CD_BA")
+
+        # Build statuses from BDC using CD_NOM if available
+        cd_nom = None
+        if taxvern_row is not None:
+            cd_nom = taxvern_row.get('CD_NOM')
+        if not cd_nom:
+            cd_nom = payload.get('CD_REF')
+
+        new_status = {}
+        if cd_nom is not None and not df_bdc.empty and cd_nom in df_bdc.index:
+            subs = df_bdc.loc[[cd_nom]] if isinstance(df_bdc.loc[cd_nom], pd.DataFrame) else pd.DataFrame([df_bdc.loc[cd_nom]])
+            for _, sub_row in subs.iterrows():
+                r = sub_row.to_dict()
+                new_status[r['LB_ADM_TR'] + "(" + r['CD_SIG'] + ")"] = {
+                    'CD_TYPE_STATUT': r['CD_TYPE_STATUT'],
+                    'LB_TYPE_STATUT': r['LB_TYPE_STATUT'],
+                    'REGROUPEMENT_TYPE': r['REGROUPEMENT_TYPE'],
+                    'CODE_STATUT': r['CODE_STATUT'],
+                    'LABEL_STATUT': r['LABEL_STATUT'],
+                    'RQ_STATUT': r['RQ_STATUT'],
+                    'CD_SIG': r['CD_SIG'],
+                    'CD_DOC': r['CD_DOC'],
+                    'NIVEAU_ADMIN': r['NIVEAU_ADMIN'],
+                    'CD_ISO3166_1': r['CD_ISO3166_1'],
+                    'CD_ISO3166_2': r['CD_ISO3166_2']
+                }
+
+        # Keep or add FR field when present in taxvern
+        if taxvern_row is not None:
+            new_status["FR"] = taxvern_row.get("FR")
+        payload["Status"] = new_status
+
+        # Ensure other_ids and images exist
+        gbif_taxon = get_gbif_taxon_id_cached(taxon_name, gbif_cache)
+        if gbif_taxon is not None:
+            ids = get_external_ids_from_gbif_taxon_cached(gbif_taxon, wikidata_cache)
+        else:
+            ids = {}
+
+        payload.setdefault('other_ids', {})
+        payload['other_ids'].setdefault('GBIF', gbif_taxon)
+        payload['other_ids'].setdefault('INaturalist', ids.get('iNaturalist taxon ID', []) if isinstance(ids, dict) else [])
+
+        if not payload.get('images'):
+            payload['images'] = get_images(gbif_taxon) if gbif_taxon else []
+
+        # Write back to Supabase
+        payload = sanitize_for_json(payload)
+        print("New payload:")
+        print(payload)
+        supabase.table("taxa").update({"payload": payload}).eq("nom_scientifique", taxon_name).execute()
+        logger.info(f"Updated payload for {taxon_name}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to update {taxon_name}: {e}")
+        return False
+
+
+def main():
+    logger.info("Starting DB-driven enrichment")
+    print("Starting DB-driven enrichment")
+
+    # Load reference files
+    try:
+        df_taxvern = pd.read_csv('TAXREFv18.txt', sep='\t', dtype=str)
+        logger.info('Loaded TAXREFv18.txt')
+    except Exception as e:
+        logger.error(f'Could not load TAXREFv18.txt: {e}')
+        df_taxvern = pd.DataFrame()
+
+    try:
+        df_bdc = pd.read_csv('BDC_18/bdc_18_01.csv', sep=',', dtype=str)
+        logger.info('Loaded BDC_18/bdc_18_01.csv')
+    except Exception as e:
+        logger.error(f'Could not load BDC file: {e}')
+        df_bdc = pd.DataFrame()
+
+    # index BDC by CD_NOM for fast lookup (if column exists)
+    if not df_bdc.empty and 'CD_NOM' in df_bdc.columns:
+        df_bdc.set_index('CD_NOM', inplace=True)
+
+    # Build TAXVERN lookup by scientific name
+    taxvern_lookup = {}
+    if not df_taxvern.empty and 'CD_NOM' in df_taxvern.columns:
+        for _, r in df_taxvern.iterrows():
+            taxvern_lookup[r['CD_NOM']] = r.to_dict()
+
+    start_index = load_checkpoint()
+    gbif_cache = load_json_file(GBIF_CACHE_FILE)
+    wikidata_cache = load_json_file(WIKIDATA_CACHE_FILE)
+
+    # Fetch all taxa from Supabase
+    try:
+        resp = supabase.table('taxa').select('nom_scientifique,payload').execute()
+        taxa = resp.data if resp and hasattr(resp, 'data') else []
+    except Exception as e:
+        logger.error(f"Failed to fetch taxa from Supabase: {e}")
+        return
+
+    logger.info(f"Fetched {len(taxa)} taxa from DB")
+
+    for i, rec in enumerate(taxa):
+        if i < start_index:
+            continue
+        try:
+            taxon_name = rec.get('nom_scientifique')
+            payload = rec.get('payload') or {}
+            logger.info(f"Processing DB row {i}: {taxon_name}")
+            print(f"Processing DB row {i}: {taxon_name}, CD_REF: {payload.get('CD_REF')}")
+
+            taxvern_row = taxvern_lookup.get(payload.get('CD_REF'))
+            print("Current taxvern_row:")
+            print(taxvern_row)
+
+            # Only process records that have a CD_REF value in their payload
+            cd_ref = payload.get('CD_REF') if isinstance(payload, dict) else None
+            if isinstance(cd_ref, str):
+                cd_ref = cd_ref.strip()
+            if not cd_ref:
+                logger.info(f"Skipping {taxon_name} because CD_REF is missing or empty")
+                print(f"Skipping {taxon_name} because CD_REF is missing or empty")
+                # advance checkpoint so we don't re-scan the same record repeatedly
+                save_checkpoint(i + 1)
+                continue
+
+            updated = update_payload_and_write(taxon_name, payload, taxvern_row, df_bdc, gbif_cache, wikidata_cache)
+
+            # Save caches and checkpoint after processing
+            save_json_file(GBIF_CACHE_FILE, gbif_cache)
+            save_json_file(WIKIDATA_CACHE_FILE, wikidata_cache)
+            save_checkpoint(i + 1)
+
+            if updated:
+                logger.info(f"Successfully processed DB row {i}")
+                print(f"Successfully processed DB row {i}")
+            else:
+                logger.warning(f"Processing completed with errors for DB row {i}")
+
+        except Exception as e:
+            logger.error(f"Error processing DB row {i}: {e}")
+            print(f"Error processing DB row {i}: {e}")
+            continue
+        break # processing continues for all records
+
+    logger.info("Finished processing DB taxa")
+    print("Finished processing DB taxa")
+
+
+if __name__ == '__main__':
+    main()
